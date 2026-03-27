@@ -1,19 +1,17 @@
 ## =============================================
 ## 1. Imports
 ## =============================================
-import os
+
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForTokenClassification, get_cosine_schedule_with_warmup, DataCollatorForTokenClassification
 from accelerate import Accelerator
 
-from token_data import load_jsonl_lazy, TokenHalDataset
+from PsiloQA_Dataset import TokenHalDataset
 from train_class_learning import TokenTrainer
 from evaluator_module import TokenEvaluator
+from InteractionLayer import ModernBertWithTokenMatch
 
-LABEL_LIST = ["O", "B-HAL", "I-HAL"]
-LABEL2ID = {l: i for i, l in enumerate(LABEL_LIST)}
-ID2LABEL = {i: l for i, l in enumerate(LABEL_LIST)}https://github.com/LimKH03/2025-2026-winter-project/blob/main/train_token_hallucination.py
 
 ## =============================================
 ## 2. Hyperparameters
@@ -25,33 +23,26 @@ BATCH_SIZE = 32
 MAX_LENGTH = 8192
 
 ACC_STEPS = 2
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TRAIN_PATH = os.path.join(SCRIPT_DIR, "psiloqa_data", "train.jsonl")
-VAL_PATH = os.path.join(SCRIPT_DIR, "psiloqa_data", "validation.jsonl")
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "token_hal_model_v1_restored")
+SCRIPT_DIR ="script"
+OUTPUT_DIR = "model_save"
 
 ## =============================================
 ## 3. Model & Data Setup
 ## =============================================
 def build_model_and_data():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForTokenClassification.from_pretrained(MODEL_NAME, num_labels=len(LABEL_LIST))
+    model = ModernBertWithTokenMatch.from_pretrained(MODEL_NAME, num_labels=2)
+    model.set_token_match(sep_token_id=tokenizer.eos_token_id)
 
     ## [가속화] Gradient Checkpointing — VRAM 절감 (속도 약간 감소 대신 메모리 대폭 절약)
     model.gradient_checkpointing_enable()
     print("  [가속화] Gradient Checkpointing: ON")
+   
 
-    train_samples = load_jsonl_lazy(TRAIN_PATH)
-    val_samples = load_jsonl_lazy(VAL_PATH)
-    
-    if not train_samples:
-        print("Train data not found. Exiting.")
-        return None, None, None, None
 
-    train_cache_path = os.path.join(SCRIPT_DIR, "psiloqa_data", f"train_cache_dp_{MAX_LENGTH}.pt")
-    val_cache_path = os.path.join(SCRIPT_DIR, "psiloqa_data", f"val_cache_dp_{MAX_LENGTH}.pt")
-
-    train_dataset = TokenHalDataset(train_samples, tokenizer, max_length=MAX_LENGTH, cache_path=train_cache_path)
+    train_dataset = TokenHalDataset(tokenizer, max_length=MAX_LENGTH, split="train")
+    val_dataset = TokenHalDataset(tokenizer, max_length=MAX_LENGTH, split="validation")
+    test_dataset = TokenHalDataset(tokenizer, max_length=MAX_LENGTH, split="test")
     
     data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer, padding=True)
     
@@ -62,21 +53,27 @@ def build_model_and_data():
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=True,
         collate_fn=data_collator,
-        pin_memory=True, num_workers=4, prefetch_factor=2,
+        pin_memory=True, num_workers=8, prefetch_factor=2,
         persistent_workers=True,  ## [가속화] 워커 프로세스 재활용 (에폭 간 재시작 방지)
     )
 
-    val_loader = None
-    if val_samples:
-        val_dataset = TokenHalDataset(val_samples, tokenizer, max_length=MAX_LENGTH, cache_path=val_cache_path)
-        val_loader = DataLoader(
-            val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-            collate_fn=data_collator,
-            pin_memory=True, num_workers=4, prefetch_factor=2,
-            persistent_workers=True,
-        )
 
-    return model, tokenizer, train_loader, val_loader
+    val_loader = DataLoader(
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        collate_fn=data_collator,
+        pin_memory=True, num_workers=8, prefetch_factor=2,
+        persistent_workers=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        collate_fn=data_collator,
+        pin_memory=True, num_workers=4, prefetch_factor=2,
+        persistent_workers=True,
+    )
+
+
+    return model, tokenizer, train_loader, val_loader, test_loader
 
 ## =============================================
 ## 4. Training
@@ -91,7 +88,7 @@ def train():
         gradient_accumulation_steps=ACC_STEPS,
     )
 
-    model, tokenizer, train_loader, val_loader = build_model_and_data()
+    model, tokenizer, train_loader, val_loader,test_loader = build_model_and_data()
     if model is None:
         return
 
@@ -109,14 +106,11 @@ def train():
     )
 
     # Accelerate로 모델, 옵티마이저, 데이터로더, 스케줄러 래핑
-    model, optimizer, train_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, scheduler
+    model, optimizer, train_loader, val_loader, test_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, test_loader, scheduler
     )
-    if val_loader is not None:
-        val_loader = accelerator.prepare(val_loader)
 
     device = accelerator.device
-    evaluator = TokenEvaluator(model=model, tokenizer=tokenizer, device=device)
 
     # 하이퍼파라미터 기록용 딕셔너리
     hyperparams = {
@@ -142,8 +136,6 @@ def train():
         optimizer=optimizer,
         device=device,
         output_dir=OUTPUT_DIR,
-        evaluator=evaluator,
-        val_data_path=VAL_PATH,
         scheduler=scheduler,
         hyperparams=hyperparams,
         accelerator=accelerator,

@@ -1,7 +1,9 @@
 from torch import nn
 from AttentionLayer import *
-from transformers import ModernBertForSequenceClassification
-from transformers.modeling_outputs import SequenceClassifierOutput
+from transformers import ModernBertForTokenClassification
+from transformers.modeling_outputs import TokenClassifierOutput
+import torch
+
 
 class TokenMatchLayer(nn.Module):
     """Source-Hypothesis 토큰 간 차이를 감지하는 레이어"""
@@ -19,11 +21,8 @@ class TokenMatchLayer(nn.Module):
             nn.GELU(),
             nn.Dropout(0.2),
         )
-        self.ddl_attn = AttentionLayer(d_model= d_model,d_ff = d_model, n_heads=8, drop_out=0.2, loops = loops)
+        self.ddl_attn = AttentionLayer(d_model= d_model,d_ff = d_model, n_heads=8, drop_out=0.2, loops=1)
 
-        self.query_prams = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.pool_attention = nn.MultiheadAttention(d_model , num_heads=8,dropout=0.2, batch_first=True)
-        torch.nn.init.kaiming_uniform_(self.query_prams)
 
 
     def forward(self, hidden_states, input_ids, attention_mask):
@@ -32,6 +31,7 @@ class TokenMatchLayer(nn.Module):
         input_ids: [batch, seq_len] — SEP 위치 찾기용
         """
         batch_size, seq_len, d_model = hidden_states.shape  # 현재 shape가지고 옴
+        output_states = hidden_states.clone() # 새로운 state를 담을 변수
         q = self.query_prams
         # [SEP] 위치 찾아서 source / hypothesis 분리
         all_match_feats = []
@@ -69,15 +69,8 @@ class TokenMatchLayer(nn.Module):
             # updated_hyp: source에서 hypothesis와 매칭되는 부분
             
             
-            diff_raw  = updated_hyp - hyp_tokens.unsqueeze(0)  # [1, hyp_len, d] #이 토큰이 얼마나 다른지
+            diff_raw  = updated_hyp
             diff = self.diff_norm(diff_raw ) #이 토큰이 어떻게 다른지
-
-
-            #pooling
-            #pooled_norm ,_ = self.pool_attention(q, diff, diff, need_weights= False)
-            #pooled_raw = diff.squeeze(0).max(dim=0)[0]
-
-            #pooled = pooled_norm.squeeze(0).squeeze(0)+ pooled_raw
 
             padding_diff = diff.squeeze(0)
             output_states[b, hyp_start:hyp_end] = hyp_tokens + padding_diff
@@ -138,45 +131,3 @@ class ModernBertWithTokenMatch(ModernBertForTokenClassification):
         )
 
 
-'''
-
-class ModernBertWithTokenMatch(ModernBertForTokenClassification):
-    """full hidden states를 활용하는 커스텀 모델"""
-    
-    def set_token_match(self, sep_token_id):
-        d_model = self.config.hidden_size  # 1024
-        self.token_match = TokenMatchLayer(d_model, sep_token_id)
-        self.match_feat_norm = nn.LayerNorm(d_model) 
-        # classifier 입력 차원을 d_model*2로 변경
-        self.merge = nn.Sequential(
-            nn.LayerNorm(d_model* 2),
-            nn.Linear(d_model * 2, d_model * 2),
-            GEGLU(d_model*2),
-            nn.Dropout(0.2)
-        )
-    
-    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        # 1. BERT 인코딩 (전체 hidden states)
-        outputs = self.model(input_ids, attention_mask=attention_mask)
-        hidden_states = outputs[0]  # [batch, seq_len, d_model]
-        
-        # 2. CLS 특징
-        #cls_feat = hidden_states[:, 0]  # [batch, d_model]
-        
-        # 3. 토큰 매칭 특징 interaction layer
-        match_feat = self.token_match(hidden_states, input_ids, attention_mask)
-        match_feat = self.match_feat_norm(match_feat) 
-        #토큰반환에선 안쓸것으로 예상 4. 합치기
-        #combined = torch.cat([cls_feat, match_feat], dim=-1)  # [batch, d_model*2]
-        #merged = self.merge(combined)  # [batch, d_model]
-        
-        # 5. 기존 classifier 
-        logits = self.classifier(match_feat)
-        
-        loss = None
-        if labels is not None:
-            loss_fct = nn.BCEWithLogitsLoss()
-            loss = loss_fct(logits, labels)
-        
-        #return SequenceClassifierOutput(logits=logits, loss=loss)
-'''

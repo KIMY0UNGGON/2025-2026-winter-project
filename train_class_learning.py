@@ -11,13 +11,11 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 class TokenTrainer:
-    def __init__(self, model, optimizer, device, output_dir, evaluator=None, val_data_path=None, scheduler=None, hyperparams=None, accelerator=None):
+    def __init__(self, model, optimizer, device, output_dir, scheduler=None, hyperparams=None, accelerator=None):
         self.model = model
         self.optimizer = optimizer
         self.device = device
         self.output_dir = output_dir
-        self.evaluator = evaluator
-        self.val_data_path = val_data_path
         self.scheduler = scheduler
         self.hyperparams = hyperparams or {}
         self.best_val_f1 = 0.0
@@ -34,12 +32,16 @@ class TokenTrainer:
             torch.backends.cuda.matmul.allow_tf32 = True
             ## [가속화] TF32 cuDNN — cuDNN 연산도 TF32 허용
             torch.backends.cudnn.allow_tf32 = True
+            
+            torch.set_float32_matmul_precision('high')
+            torch.backends.cudnn.benchmark = True  # [속도 최적화] 입력 크기에 맞는 최적 알고리즘 자동 선택
+            torch._dynamo.config.capture_scalar_outputs = True
+
             print("  [가속화] cuDNN Benchmark: ON | TF32 MatMul: ON | TF32 cuDNN: ON")
         
-        # 클래스 가중치 설정: O=1.0, B-HAL=5.0, I-HAL=1.5
-        class_weights = torch.tensor([1.0, 5.0, 1.5]).to(self.device)
+
+
         self.criterion = nn.CrossEntropyLoss(
-            weight=class_weights, 
             ignore_index=-100,
             label_smoothing=0.1
         )
@@ -173,13 +175,6 @@ class TokenTrainer:
             if val_f1 is not None:
                 if val_f1 > self.best_val_f1:
                     self._save_checkpoint(self.output_dir, ep + 1, val_f1, val_loss, avg_loss, f1)
-                    early_stop_counter = 0
-                else:
-                    early_stop_counter += 1
-                    print(f" >>> Val F1 did not improve. Early stopping counter: {early_stop_counter}/{self.patience}")
-                    if early_stop_counter >= self.patience:
-                        print(f"Early Stopping triggered at Epoch {ep+1}!")
-                        break
             else:
                 # Validation이 없는 경우 매 에폭 저장
                 self._save_checkpoint(self.output_dir, ep + 1, 0, 0, avg_loss, f1)
